@@ -1,26 +1,514 @@
 <!DOCTYPE html>
-<html lang="en" >
+
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"> 
-  <link rel="stylesheet" href="styles.css">
-  <link rel="script" href="script.js">
- 
-    
-  <link rel="apple-touch-icon" sizes="180x180" href="mddFavicons/apple-touch-icon.png">
-  <link rel="icon" type="image/png" sizes="32x32" href="mddFavicons/favicon-32x32.png">
-  <link rel="icon" type="image/png" sizes="16x16" href="mddFavicons/favicon-16x16.png">
-  <link rel="manifest" href="mddFavicons/site.webmanifest">
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Predator vs. Vigilante: A BSim Analysis of Mirai and Hajime</title>
 
-  <title>Tristen Greene Final Project</title>
+
+
+
+    &lt;!-- No CSS version: plain semantic HTML only. Keep the images/ folder next to this file. --&gt;
 </head>
+<body>
+<header>
+CYBR 570 // Final Project
+<h1>Predator vs. Vigilante</h1>
+<p>A binary similarity (BSim) analysis of Mirai and Hajime, two IoT worms that fought over the same devices for opposite reasons.</p>
+<p>Tristen Greene · Reverse Engineering · June 8, 2026</p>
+</header>
+<div>
+<article>
+<!-- ===================== TOC ===================== -->
+<nav>
+<h3>Contents</h3>
+<ol>
+<li><a href="#objective">Objective</a></li>
+<li><a href="#background">Background and Literature</a></li>
+<li><a href="#tools">Tools Used</a></li>
+<li><a href="#process">Process Walkthrough (step by step)</a></li>
+<li><a href="#deadends">Dead Ends and How I Got Past Them</a></li>
+<li><a href="#functions">Most Interesting Functions</a></li>
+<li><a href="#comparison">Mirai vs. Hajime: Compare and Contrast</a></li>
+<li><a href="#results">Results</a></li>
+<li><a href="#limitations">Limitations and Scope</a></li>
+<li><a href="#future">Future Reverse Engineering Goals</a></li>
+<li><a href="#source">Source Code</a></li>
+<li><a href="#references">References</a></li>
+</ol>
+</nav>
+<!-- ===================== OBJECTIVE ===================== -->
+<h2 id="objective">Objective</h2>
+<p>My goal for this project was to use Ghidra's BSim binary similarity engine to compare two families of IoT malware that are often discussed together because they targeted the same population of embedded devices. Mirai is a malicious DDoS botnet. Hajime is a vigilante worm that infects devices and then hardens them. The starting question was simple: are Mirai and Hajime actually code relatives, or are they only similar because they lived in the same IoT ecosystem and solved the same propagation problems?</p>
+<p>I treated the common “Mirai versus Hajime” framing as a hypothesis to test, not as a conclusion. If the two families were source-level sisters, BSim should surface shared functions after unpacking and normalizing the samples. If they were not, then the similarity would be ecological rather than genetic: Hajime would be more like an evolutionary response to Mirai's niche than a fork of Mirai itself.</p>
+<p>Either outcome is a real result. If BSim surfaces shared functions, that points to shared source or borrowed code. If it does not, that is evidence of convergent evolution, where two authors arrived at similar behavior without sharing code. The interesting part of the project was learning how to make BSim answer that question honestly, rather than letting it answer an easier question about shared runtime libraries.</p>
+<div>
+<div>Why this matters</div>
+<p>Mirai and Hajime both spread across MIPS, ARM, and other embedded architectures. If similarity analysis can link malware behavior across architectures, that is a powerful triage tool. If it cannot, analysts need to know its limits before they trust a result.</p>
+</div>
+<!-- ===================== BACKGROUND ===================== -->
+<h2 id="background">Background and Literature</h2>
+<div>
+<div><div>Predator</div><div>Mirai</div></div>
+<div>vs.</div>
+<div><div>Vigilante</div><div>Hajime</div></div>
+</div>
+<h3>Mirai</h3>
+<p>Mirai is the IoT botnet that knocked large parts of the internet offline in late 2016, including the attacks on the security journalist Brian Krebs, the hosting provider OVH, and the DNS provider Dyn. Antonakakis and a large group of co-authors documented its growth to roughly 600,000 infected devices in their USENIX Security 2017 retrospective [1]. Mirai spreads by scanning the internet for devices with open telnet and trying a built in list of default credentials. Once it has a foothold it reports to a centralized command and control server, which can direct the bots to launch a range of denial of service attacks. The source code was published publicly by a user calling themselves Anna-senpai in 2016, which is why so many variants exist today and why MalwareBazaar's Mirai tag covers a sprawling family rather than one clean lineage [1][2].</p>
+<h3>Hajime</h3>
+<p>Hajime, which means "beginning" in Japanese, was first reported by Sam Edwards and Ioannis Profetis at Rapidity Networks in October 2016 [3]. It targets the same kinds of devices as Mirai and spreads the same way, through telnet and weak credentials, but it carries no attack payload. Instead it appears to be the work of a vigilante author who closes the ports commonly abused by Mirai and similar worms, including telnet on port 23 and the TR-064 and TR-069 management ports, effectively locking competitors out of the device [5]. Later measurement work by Herwig and colleagues at NDSS 2019 described Hajime as two cooperating ELF modules, a core implant that handles peer to peer tasks and a separate attack module that handles scanning and propagation, with builds for arm5, arm6, arm7, mipseb, and mipsel [4].</p>
+<p>The most distinctive thing about Hajime is its command and control design. Rather than calling home to a server, it joins a decentralized peer to peer network built on BitTorrent's DHT for peer discovery and the uTorrent transport protocol for data transfer, with its traffic encrypted using RC4 [3][6]. That decentralized design makes it far harder to take down than Mirai's server based model.</p>
+<div>
+<div>A note on packing</div>
+<p>The original Rapidity report described Hajime's transferred P2P modules as using LZ4 compression, and some samples in the wild have been observed packed with UPX. The samples I analyzed were different again. They were packed with a custom framed LZMA stream, which I had to reverse before any analysis was possible. I treat that as one of my own findings rather than something taken from the literature.</p>
+</div>
+<!-- ===================== TOOLS ===================== -->
+<h2 id="tools">Tools Used</h2>
+<p>Some of these we used in class, so I describe them briefly. The ones we did not cover together (BSim, telfhash and tlsh, qemu user mode, and the custom decoder) I describe in more depth in the walkthrough.</p>
+<div>
+<div><h4>Ghidra</h4><p>Disassembly and decompilation of every sample. Primary workbench.</p></div>
+<div><h4>BSim</h4><p>Ghidra's similarity engine. Builds a database of function feature vectors from P-code and queries it for near matches across binaries and architectures.</p></div>
+<div><h4>MalwareBazaar API</h4><p>abuse.ch sample repository. Queried by hash, telfhash, tlsh, and signature to source and cluster samples.</p></div>
+<div><h4>telfhash / tlsh</h4><p>Locality sensitive hashes for ELF files. Used to cluster samples related to a ground truth seed.</p></div>
+<div><h4>qemu-user (mips)</h4><p>MIPS user mode emulation, used while attempting to run the Hajime unpacker under a debugger.</p></div>
+<div><h4>gdb-multiarch</h4><p>Remote debugging of the emulated MIPS samples through qemu's gdb stub.</p></div>
+<div><h4>Docker</h4><p>Disposable, network isolated container for safely handling live malware.</p></div>
+<div><h4>Python 3 + pyzipper</h4><p>Custom reference LZMA1 decoder, ELF wrapper, and the AES zip handling for MalwareBazaar downloads.</p></div>
+</div>
+<!-- ===================== PROCESS ===================== -->
+<h2 id="process">Process Walkthrough (step by step)</h2>
+<p>This is written so a fresh reverse engineer could reproduce it. The work breaks into four phases: building a clean Mirai cohort, getting Hajime into an analyzable state, building the BSim database, and querying it sensibly.</p>
+<h3>Phase 1: Build a clean Mirai cohort from one ground truth sample</h3>
+<p>As I explain in the Dead Ends section, querying a broad "Mirai" pile gave misleading matches. The fix was to anchor on a single not stripped sample whose symbols name the functions I care about, then gather only its close relatives.</p>
+<ol>
+<li>Find a not stripped seed
+                    Run <code>file</code> over your samples and look for one that says <code>not stripped</code>. A stripped binary hides function names. A not stripped one keeps its symbol table, which is what makes it usable as ground truth.
+                    <pre><code>file *.elf | grep "not stripped"</code></pre>
+                    My seed was <code>0ea04179b34505024e111f254542d43f53765dc03f784e1efd10a88893e52662</code>, named <code>iran.mipsrouter</code>, an ELF 32 bit MSB MIPS-I statically linked binary.
+                </li>
+<li>Get a MalwareBazaar API key
+                    Create a free account at abuse.ch, generate an Auth-Key, and export it so the script can read it.
+                    <pre><code>export MB_API_KEY="YOUR-AUTH-KEY-HERE"</code></pre>
+</li>
+<li>Pull the seed's fuzzy hashes
+                    A <code>get_info</code> query returns the seed's <code>telfhash</code> and <code>tlsh</code>. telfhash is a locality sensitive hash built from an ELF's symbol and function layout, and tlsh is a more general fuzzy hash. Samples built from the same source tend to share close values.
+                </li>
+<li>Query for relatives three ways
+                    My script <code>find_groundtruth_similar.py</code> queries by <code>get_telfhash</code>, <code>get_tlsh</code>, and, as a broad fallback, the <code>Mirai</code> signature filtered to a filename cluster. It deduplicates by SHA256 and ranks every candidate by closeness to the seed:
+                    <pre><code>def candidate_score(item, seed_info):
+    score = 0
+    if arch == "mips": score += 20
+    if ftype == "elf": score += 20
+    if sig == "mirai": score += 10
+    if name == seed_name: score += 50
+    if "mipsrouter" in name: score += 40
+    if "iran" in name: score += 30
+    if "mipsel" in name: score -= 100   # wrong endianness, reject
+    # plus a bonus for file sizes close to the seed</code></pre>
+</li>
+<li>Filter to the exact architecture
+                    For a tight cohort I kept only binaries that match the seed exactly, checked against <code>file</code>:
+                    <pre><code>def is_target_file(file_output):
+    s = file_output.lower()
+    return ("elf 32-bit msb executable" in s
+            and "mips" in s and "mips-i" in s
+            and "statically linked" in s)</code></pre>
+</li>
+<li>Download, extract, and keep the matches
+                    MalwareBazaar serves samples as AES encrypted zips with the password <code>infected</code>. The script downloads each candidate, extracts it with <code>pyzipper</code>, runs <code>file</code>, keeps only the architecture matches, logs every decision to a CSV, and stops once it has enough.
+                    <pre><code>python3 find_groundtruth_similar.py --want 15</code></pre>
+</li>
+</ol>
+<div>
+<div>Safety</div>
+<p>These are live botnet samples. They stay zipped with the <code>infected</code> password until needed, are never executed during sourcing, and analysis happens only inside Ghidra or a network isolated container.</p>
+</div>
+<div>Script output: ranked candidates and KEEP / Reject decisions</div>
+<h3>Phase 2: Get Hajime analyzable (unpack the LZMA payload)</h3>
+<p>Every Mirai sample decompiled immediately. The Hajime samples are packed, and unpacking them was the largest single piece of work in this project. The full play by play is in the Dead Ends section. The reproducible steps are:</p>
+<ol>
+<li>Confirm the packing In Ghidra the entry at <code>0x112fe8</code> is unreachable, the segment is flagged truncated, and the mapped bytes are high entropy.</li>
+<li>Identify the stub Disassembled big endian, the entry is an LZMA decompressor: a position independent prologue, the <code>cacheflush</code> syscall (4147), and a range coder with LZMA's constants.</li>
+<li>Decode statically on the host A reference LZMA1 decoder reproduces the stub and only reads and decompresses, so it is host safe.
+                    <pre><code>python3 lzma_unpack.py
+# [+] HajimeN.elf: off=0x102 lc=3 lp=0 pb=2 ... -&gt; HajimeN_unpacked.bin</code></pre>
+                    Nine of ten samples decoded cleanly, each with its stream at offset <code>0x102</code>.</li>
+<li>Wrap as ELF
+<pre><code>python3 wrap_elf.py
+# [+] HajimeN_unpacked.bin -&gt; HajimeN_unpacked.elf  entry=0x400018</code></pre></li>
+<li>Import into Ghidra File &gt; Import each <code>_unpacked.elf</code>; it auto detects as ELF / MIPS:BE:32 and the entry decompiles.</li>
+</ol>
+<div>Ghidra: packed entry with no code, beside the unpacked, decompiling entry</div>
+<h3>Phase 3: Build the BSim database</h3>
+<p>BSim stores function feature vectors in a database and matches new functions against them. I used the H2 backend, a single local file with no server. The key choice is the database template.</p>
+<ol>
+<li>Analyze every program Import and auto analyze all Mirai samples, the unpacked Hajime ELFs, and the not stripped ground truth into one Ghidra project, and save.</li>
+<li>Create the database with the nosize template From a shell in the Ghidra install (exit the GUI first, since H2 allows one process at a time):
+                    <pre><code>cd &lt;ghidra_install_dir&gt;/support
+./bsim createdatabase file:/&lt;db_dir&gt;/mirai_hajime medium_nosize</code></pre>
+                    The <code>nosize</code> template ignores varnode size differences of four bytes and up, which is what allows 32 and 64 bit, and cross architecture, code to match. That is deliberate, since it sets up the architecture agnostic comparison.</li>
+<li>Generate signatures
+<pre><code>mkdir ~/bsim_sigs
+./bsim generatesigs ghidra:/&lt;project_dir&gt;/MiraiHajime ~/bsim_sigs \
+    --bsim file:/&lt;db_dir&gt;/mirai_hajime</code></pre></li>
+<li>Commit signatures
+<pre><code>./bsim commitsigs file:/&lt;db_dir&gt;/mirai_hajime ~/bsim_sigs</code></pre></li>
+<li>Connect from the GUI Reopen Ghidra, then BSim &gt; Manage Servers, add the H2 file, and right click any function to search it against the database.</li>
+</ol>
+<div>BSim Manage Servers dialog with the H2 database connected</div>
+<h3>Phase 4: Query with ground truth, not raw confidence</h3>
+<ol>
+<li>Sanity check the database Query a known helper like <code>generic_checksum</code> from the ground truth sample. It matched into a stripped sample, proving ingestion and architecture handling were correct.</li>
+<li>Ignore the libc noise Discard matches for <code>recv</code>, <code>send</code>, <code>malloc</code>, <code>printf</code>, <code>__uClibc_main</code>, and similar. High hit counts there mean shared runtime, not shared malware.</li>
+<li>Query the malware functions Search <code>syn_attack</code>, <code>udpplain_attack</code>, and the random and IP generation routines, and note where they match across the cohort.</li>
+<li>Pivot through the call graph Where an attack function does not match directly, anchor on a stable helper that does and follow its callers to locate the candidate in the stripped binary.</li>
+</ol>
+<div>BSim query results: a named ground-truth function matching into a stripped sample</div>
+<!-- ===================== DEAD ENDS ===================== -->
+<h2 id="deadends">Dead Ends and How I Got Past Them</h2>
+<h3>Dead End 1: Hajime was packed and Ghidra could not see the code</h3>
+<p>The first time I loaded a Hajime sample into Ghidra I had no decompiler view at all. The ELF header pointed the entry at <code>0x112fe8</code>, but when I tried to jump there Ghidra reported "No results for 0x112fe8." The loadable segment was flagged as truncated, and the bytes Ghidra did map looked like high entropy noise instead of instructions. An unreachable entry point plus near random data is the classic signature of a packed binary.</p>
+<p>Once I forced the correct big endian setting and disassembled the entry, the picture cleared up. The code at the entry was a decompression stub. It used the standard MIPS position independent prologue to locate itself, called the MIPS <code>cacheflush</code> syscall (number 4147) after writing to memory, and ran a range coder with the exact constants that define LZMA. Hajime ships its real payload as an LZMA compressed blob with a small unpacker in front of it. The only nonstandard part was the property header, which packs the LZMA parameters into two custom bytes instead of the usual single byte plus dictionary size. That custom framing is exactly why tools like xz and Detect It Easy could not name the packer.</p>
+<h4>What I tried first</h4>
+<p>My instinct was to let the sample unpack itself and dump the result, inside a throwaway Docker container with networking disabled and capabilities dropped, under qemu user mode emulation with a gdb stub.</p>
+<div>
+<div>Safety</div>
+<p>These are live IoT botnet binaries. I never ran them on my host. Everything that involved execution happened inside a network isolated container, and the breakpoint was always set before any malicious code could run.</p>
+</div>
+<p>This failed the same way every time. As soon as the decompressor started, qemu raised a SIGBUS. The reason is specific to MIPS. The unpacker performs unaligned memory accesses, which a real MIPS Linux kernel silently fixes up in its exception handler. qemu user mode does not emulate that fixup, so it faults instead. Full system emulation would have run it, but that meant a kernel, a root filesystem, and moving samples in and out of a virtual machine, which was a lot of overhead for ten files. I also tried Python's built in lzma module, which refused the stream because it has no end marker and because liblzma caps the literal context parameters in a way the LZMA SDK does not.</p>
+<h4>What actually worked</h4>
+<p>Since the stub was decoding an ordinary LZMA stream, I wrote my own reference LZMA1 decoder in Python with no parameter cap, so it would decode exactly what the on device stub decodes. It only reads bytes and decompresses, so it was safe to run on my host. It cracked nine of my ten samples, each with its stream at offset <code>0x102</code> and standard parameters, every decode ending cleanly on input exhaustion. After wrapping the output as an ELF, the entry finally decompiled:</p>
+<pre><code>/* WARNING: Globals starting with '_' overlap smaller symbols at the same address */
 
-<main>
-  <h1>Mirai/Hajine: A Comparative Analysis</h1>
-
-
-
-
-
-
-</main>
+void processEntry entry(void)
+{
+  (*(code *)(_DAT_0047458c + 0x21c))();
+  (*(code *)(_DAT_00474588 + 0x1a00))();
+  return;
+}</code></pre>
+<p>The two indirect calls go through gp relative pointers, which is normal for position independent code. The real targets are filled in at runtime through the global offset table, so Ghidra shows the dispatch but cannot resolve the destinations statically. That is fine for BSim, which matches on the structure of decompiled functions rather than on absolute addresses.</p>
+<div>
+<div>Lesson</div>
+<p>Hajime ships packed and Mirai does not, and that difference is itself a finding. Static decompression beat dynamic emulation here. Once I recognized the stub as LZMA, reimplementing the decoder was more reliable than fighting qemu.</p>
+</div>
+<h3>Dead End 2: BSim was matching the runtime, not the malware</h3>
+<p>Early on I assumed that any high confidence BSim result would help me identify Mirai behavior. That assumption was wrong. Because my samples were statically linked ELF binaries, the database filled up with shared libc and uClibc code. Functions like <code>recv</code>, <code>send</code>, <code>select</code>, <code>malloc</code>, <code>printf</code>, <code>vfscanf</code>, <code>vfprintf</code>, <code>strlen</code>, <code>strcmp</code>, and <code>__uClibc_main</code> produced a lot of matches, but those matches mostly proved that the binaries shared common runtime code, not that they shared anything specific to Mirai.</p>
+<p>This became obvious once I found a sample that was not stripped and used it as ground truth. Its symbol table exposed the malware relevant names I actually cared about, including <code>main</code>, <code>syn_attack</code>, <code>udpplain_attack</code>, <code>daemonize</code>, <code>cleanup_old_processes</code>, and <code>generic_checksum</code>. A second not stripped sample exposed <code>vseattack</code>, <code>makeRandomStr</code>, <code>getRandomIP</code>, <code>init_rand</code>, <code>rand_cmwc</code>, and <code>mainCommSock</code>. When I searched for <code>syn_attack</code> and <code>udpplain_attack</code> against the broad set, though, the only match I usually got was the ground truth binary itself.</p>
+<p>At first I read this as a BSim failure, but a smaller test showed the database was working fine. The <code>generic_checksum</code> helper did match into a stripped Mirai sample, which ruled out any problem with ingestion or my architecture setup. The real problem was that my sample set was too broad. MalwareBazaar's Mirai signature pulls in many related Linux IoT botnet variants whose attack modules were not necessarily compiled from the same source. Stable helper routines matched well across variants, while higher level attack routines did not.</p>
+<p>That changed my methodology, and it is what drove the ground truth cohort sourcing in Phase 1. Once I rebuilt the comparison against the tight <code>iran.mipsrouter</code> cohort instead of the broad pile, the attack functions started matching across the whole set, as shown in the next section.</p>
+<div>
+<div>Lesson</div>
+<p>BSim is not a magic find Mirai button. For statically linked malware, high hit counts can be misleading because they often point at runtime code. The strategy that worked was to use not stripped samples as ground truth, ignore the libc heavy results, and compare within a tight, source aligned cohort rather than across every Mirai tagged binary.</p>
+</div>
+<!-- ===================== FUNCTIONS ===================== -->
+<h2 id="functions">Most Interesting Functions</h2>
+<p>I reverse engineered three Mirai functions in detail from the not stripped ground truth sample. These show the three things Mirai needs to be a weapon: it has to flood, it has to flood efficiently, and it has to keep the device to itself.</p>
+<h3><code>syn_attack</code> — raw socket TCP SYN flood mirai</h3>
+<p>This is Mirai's classic SYN flood. It opens a raw socket and turns on <code>IP_HDRINCL</code> so it can hand build every IP and TCP header itself, which is what lets it spoof source addresses:</p>
+<pre><code>local_2c = socket(2,3,6);                 // AF_INET, SOCK_RAW, IPPROTO_TCP
+local_650 = 1;
+setsockopt(local_2c,0,3,&amp;local_650,4);    // IP_HDRINCL: I build the headers</code></pre>
+<p>The attack options come from a configuration struct passed in <code>param_1</code>, and mapping the offsets the function reads recovers Mirai's TCP option layout: the on/off flag at <code>+0x14</code>, the duration at <code>+0x10</code>, the destination address at <code>+0x20</code> with its CIDR prefix at <code>+0x24</code> (a value of <code>0x20</code> means a single <code>/32</code> host, anything smaller means spray the subnet), the source port at <code>+0x1c</code> (randomized when zero), the static payload at <code>+0x25</code> with its length at <code>+0xa8</code>, and the pacing window at <code>+0xac</code> and <code>+0xb0</code>. Packet size is clamped between <code>0x28</code> (40 bytes, the minimum IP plus TCP header) and <code>0x5dc</code> (1500, the MTU).</p>
+<p>It hand builds the IP header (the leading byte <code>0x45</code> is IP version 4 with a five word header, <code>0x40</code> is a TTL of 64, and <code>0x06</code> is protocol TCP) and sets the TCP data offset and control flags so that every packet is a SYN segment. When a netmask is set it derives the network base, the first usable address, and the last address from <code>ip &amp; mask</code> and walks the range, so a single call can flood an entire block. For every packet it randomizes the fields that should look unique (source port, sequence number, IP id, and any random payload), recomputes both checksums, and sends:</p>
+<pre><code>local_622 = generic_checksum(&amp;local_62c,0x14);             // IP header checksum
+local_608 = tcp_udp_checksum(&amp;local_618,uVar4-0x14,...);   // TCP checksum
+sendto(local_2c,&amp;local_62c,uVar4,0x4000,&amp;local_63c,0x10);</code></pre>
+<p>It loops until the configured duration elapses (it compares <code>time()</code> against a deadline) or the attack flag at <code>+0x14</code> is cleared. The optional <code>usleep</code> paces the flood when a rate limit is set.</p>
+<h4>BSim: does this generalize across the cohort?</h4>
+<p>I treated my reverse engineered <code>syn_attack</code> as the reference sample and queried it against the ground truth aligned cohort. The same function is present in all ten samples. Most matched at a perfect 1.000 similarity, which is expected for statically linked sibling builds compiled from the same source, with one sample coming in lower at 0.896, most likely a slightly different build or compiler settings. That single outlier is what makes the result credible rather than suspicious: identical source compiled the same way should match at or near 1.000.</p>
+<table>
+<thead><tr><th>Matched sample</th><th>Similarity</th><th>Confidence</th></tr></thead>
+<tbody>
+<tr><td>GroundTruth</td><td>1.000</td><td>540.448</td></tr>
+<tr><td>SimilarMirai1</td><td>1.000</td><td>540.448</td></tr>
+<tr><td>SimilarMirai2</td><td>1.000</td><td>540.448</td></tr>
+<tr><td>SimilarMirai3</td><td>1.000</td><td>540.448</td></tr>
+<tr><td>SimilarMirai4</td><td>1.000</td><td>540.448</td></tr>
+<tr><td>SimilarMirai5</td><td>1.000</td><td>540.448</td></tr>
+<tr><td>SimilarMirai6</td><td>1.000</td><td>540.448</td></tr>
+<tr><td>SimilarMirai7</td><td>1.000</td><td>540.448</td></tr>
+<tr><td>SimilarMirai8</td><td>0.896</td><td>463.587</td></tr>
+<tr><td>SimilarMirai9</td><td>1.000</td><td>540.448</td></tr>
+<tr><td>SimilarMirai10</td><td>1.000</td><td>540.448</td></tr>
+</tbody>
+</table>
+<figure>
+<img alt="BSim Function Matches window showing syn_attack matches across the cohort" src="images/bsim-syn-attack.png"/>
+<figcaption>BSim function matches for <code>syn_attack</code> across the ground-truth-aligned cohort.</figcaption>
+</figure>
+<p>This is the payoff of the cohort methodology from Dead End 2. The exact query that returned only ground truth against the broad pile now returns all ten cohort members once the comparison is restricted to source aligned siblings.</p>
+<h3><code>udpplain_attack</code> — high rate UDP flood mirai</h3>
+<p>Where <code>syn_attack</code> is built for spoofing, <code>udpplain_attack</code> is built for raw throughput. It opens an ordinary UDP socket rather than a raw one, so the kernel fills in the IP and UDP headers and the function never touches <code>IP_HDRINCL</code> or the checksum helpers. That is the whole point of the "plain" variant: dropping header crafting and source spoofing buys the highest packet rate of any Mirai vector.</p>
+<pre><code>__fd = socket(2,1,0x11);                       // UDP socket
+do { lVar4 = rand(); *puVar6 = (char)lVar4; }  // random payload bytes
+    while (sVar13 != sVar9);
+sendto(__fd,local_38,sVar13,0x4000,param_1,0x10);   // blast the target</code></pre>
+<p>Its options are overlaid on the incoming <code>sockaddr</code> array rather than a flat struct, but they mirror the SYN flood: a packet size range (clamped again at <code>0x5dc</code>), a duration, a pacing window, an optional static payload copied in with <code>memcpy</code>, and the same single host versus subnet logic keyed off a prefix byte. The inner loop just randomizes a payload and calls <code>sendto</code> as fast as it can until the clock runs out.</p>
+<h4>BSim: does this generalize across the cohort?</h4>
+<p>Querying my reverse engineered <code>udpplain_attack</code> against the cohort gives the same shape of result as the SYN flood: a match in all ten samples, nine at a perfect 1.000 and the same lone outlier, SimilarMirai8, at 0.980. The confidence here (about 410) is a little lower than the SYN flood's (about 540) because the function is slightly smaller. That is worth knowing on its own: BSim confidence scales with function size, so two equally perfect matches can carry different significance.</p>
+<table>
+<thead><tr><th>Matched sample</th><th>Similarity</th><th>Confidence</th></tr></thead>
+<tbody>
+<tr><td>GroundTruth</td><td>1.000</td><td>410.112</td></tr>
+<tr><td>SimilarMirai1</td><td>1.000</td><td>410.112</td></tr>
+<tr><td>SimilarMirai2</td><td>1.000</td><td>410.112</td></tr>
+<tr><td>SimilarMirai3</td><td>1.000</td><td>410.112</td></tr>
+<tr><td>SimilarMirai4</td><td>1.000</td><td>410.112</td></tr>
+<tr><td>SimilarMirai5</td><td>1.000</td><td>410.112</td></tr>
+<tr><td>SimilarMirai6</td><td>1.000</td><td>410.112</td></tr>
+<tr><td>SimilarMirai7</td><td>1.000</td><td>410.112</td></tr>
+<tr><td>SimilarMirai8</td><td>0.980</td><td>398.973</td></tr>
+<tr><td>SimilarMirai9</td><td>1.000</td><td>410.112</td></tr>
+<tr><td>SimilarMirai10</td><td>1.000</td><td>410.112</td></tr>
+</tbody>
+</table>
+<figure>
+<img alt="BSim Function Matches window: udpplain_attack, 11 results across the cohort" src="images/bsim-udp-attack.png"/>
+<figcaption>BSim function matches for udpplain_attack across the ground-truth-aligned cohort.</figcaption>
+</figure>
+<h3><code>cleanup_old_processes</code> — killer and honeypot check mirai</h3>
+<p>This function is part of Mirai's "killer" behavior, the code that keeps the device to itself and watches for analysis sandboxes. It first checks for <code>/proc</code>, and if the directory is missing, which is normal on a crude sandbox but not on a real Linux device, it writes a taunt to stderr that also signs the build:</p>
+<pre><code>if (access("/proc",0) != 0)
+    fwrite("Looks like you are a honeypot, this tool was made by t.me/flylegit!\n", ...);</code></pre>
+<p>That string is a useful indicator of compromise and attributes this variant to a "flylegit" operator. It then walks <code>/proc</code>. The detail I found most telling is how it decides which entries to process: it indexes the C library's <code>__ctype_b</code> character classification table to test whether the first character of each directory name is a digit, so it only looks at numeric PID directories and skips everything else. For each PID it opens <code>/proc/&lt;pid&gt;/comm</code>, reads the process name, and normalizes it by cutting at the first carriage return or newline with <code>strcspn</code>, then stripping trailing whitespace using the same <code>__ctype_b</code> table for the space class:</p>
+<pre><code>if ((*(ushort *)((uint)(byte)pdVar3-&gt;d_name[0] * 2 + __ctype_b) &amp; 8) == 0) break; // isdigit
+snprintf(acStack_118,0x100,"/proc/%s/comm",pdVar3-&gt;d_name);
+sVar4 = read(open(acStack_118,0),__s,0x3f);   // read each process's command name</code></pre>
+<p>In full Mirai this normalized name feeds a blacklist comparison that terminates competing bots and known bad processes. The recovered routine is the enumeration and name normalization core of that logic, plus the honeypot detection, which makes this both an anti competitor and an anti analysis function.</p>
+<h4>BSim: does this generalize across the cohort?</h4>
+<p>This is the cleanest match of the three. <code>cleanup_old_processes</code> matches all ten samples at a perfect 1.000 with no outlier at all, SimilarMirai8 included. The confidence is much lower (about 128) because the function is small, so even a perfect match is less individually significant than the larger attack functions. The interesting part is the contrast: SimilarMirai8 diverged from the rest in both attack functions yet is equivalent here. Its differences live in the attack code, not the survival code.</p>
+<table>
+<thead><tr><th>Matched sample</th><th>Similarity</th><th>Confidence</th></tr></thead>
+<tbody>
+<tr><td>GroundTruth</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai1</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai2</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai3</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai4</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai5</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai6</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai7</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai8</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai9</td><td>1.000</td><td>128.060</td></tr>
+<tr><td>SimilarMirai10</td><td>1.000</td><td>128.060</td></tr>
+</tbody>
+</table>
+<figure>
+<img alt="BSim Function Matches window: cleanup_old_processes, 11 results across the cohort" src="images/bsim-cleanup.png"/>
+<figcaption>BSim function matches for cleanup_old_processes across the ground-truth-aligned cohort.</figcaption>
+</figure>
+<div>
+<div>What the three tables show together</div>
+<p>Across all three functions the cohort matches at or near 1.000, which confirms these really are sibling builds from one source line. The one moving piece is SimilarMirai8: the lone outlier in both attack functions (0.896 for SYN, 0.980 for UDP) yet a perfect match for the killer. The divergence is concentrated in the attack code, exactly where botnet operators tend to tweak and recompile, and BSim pointed straight at it without my reading a single instruction of SimilarMirai8.</p>
+</div>
+<h3>Hajime functions</h3>
+<p>Hajime was harder to analyze than Mirai because the useful code was hidden behind the LZMA unpacker and the unpacked binaries were stripped. Mirai gave me names like <code>syn_attack</code> because I found a not stripped ground truth sample. Hajime did not. For Hajime, I had to rank the unpacked functions by BSim match count and confidence, then read the actual decompiler output and assign analyst names based on behavior.</p>
+<p>The three most important Hajime functions I recovered were <code>hajime_protocol_event_loop</code>, <code>hajime_peer_session_manager</code>, and <code>hajime_peer_table_update</code>. The names are mine, but the code snippets below are from the actual functions. Hajime6 is not listed in the BSim tables because it was the one sample my LZMA unpacking pipeline did not successfully recover into an analyzable ELF.</p>
+<h3><code>hajime_protocol_event_loop</code> — P2P message parser and maintenance loop hajime</h3>
+<p>This is the strongest Hajime function I recovered. It looks like the central protocol parser and scheduler for the unpacked Hajime payload. The first clue is the input validation. The function calculates the end of the incoming buffer with <code>param_1 + param_2</code>, then rejects the message if the final byte is not a null terminator. That is not the shape of a flood routine like Mirai's <code>syn_attack</code>; this is a function that expects a structured peer-to-peer message and refuses malformed input before doing any deeper parsing.</p>
+<pre><code>pcVar25 = (char *)(param_1 + param_2);
+if (*pcVar25 != '\0') {
+    puVar6 = (undefined4 *)(*_DAT_004747e8)();
+    *puVar6 = 0x16;
+    return 0xffffffff;
+}</code></pre>
+<p>After the null-terminated buffer check, the function searches the message for markers from Hajime's string table, parses numeric length fields, bounds-checks those lengths, and copies peer data into stack buffers. The most useful evidence is the section that accepts either six-byte or eighteen-byte records. A six-byte record lines up with an IPv4 address plus a two-byte port. An eighteen-byte record lines up with an IPv6 address plus a two-byte port. That makes this look like peer contact parsing, which matches Hajime's decentralized P2P design.</p>
+<pre><code>if (iVar9 == 6) {
+    if (local_38 + 6 &lt; 0x801) {
+        *(undefined4 *)((int)&amp;uStack_1040 + local_38) =
+            *(undefined4 *)(local_1720[0] + 1);
+        acStack_103c[local_38] = local_1720[0][5];
+        acStack_103c[local_38 + 1] = local_1720[0][6];
+        local_38 = local_38 + 6;
+    }
+}
+else if ((iVar9 == 0x12) &amp;&amp; (local_3c + 0x12 &lt; 0x801)) {
+    *(undefined4 *)((int)auStack_840 + local_3c) =
+        *(undefined4 *)(local_1720[0] + 1);
+    /* copies the rest of the 18-byte IPv6+port record */
+    local_3c = local_3c + 0x12;
+}</code></pre>
+<p>The most important block is the message dispatch. After parsing the message, the function identifies one of five message types and jumps through a table at <code>_DAT_00474588 + 0x1fa0</code>. This is why I labeled it an event loop. It does not just decode one field; it validates a message, extracts peer material, chooses a handler, and transfers control to the appropriate protocol routine.</p>
+<pre><code>if (((local_1724 != 0) || (iVar9 != 5)) &amp;&amp; (iVar9 - 1U &lt; 5)) {
+    uVar19 = (*(code *)(&amp;_gp_1 +
+              *(int *)((iVar9 - 1U) * 4 + _DAT_00474588 + 0x1fa0)))();
+    return uVar19;
+}</code></pre>
+<p>The bottom half of the same function handles maintenance. It walks linked lists of peer structures, removes stale entries, frees empty records, schedules future peer activity with random jitter, and writes the next timeout back through <code>param_5</code>. That is the biggest difference from Mirai. Mirai's most interesting functions are weaponized packet builders; Hajime's most interesting function is a peer-to-peer message loop that keeps a decentralized network alive.</p>
+<pre><code>if (*(int *)(_DAT_00474584 + 22000) &lt; *(int *)(_DAT_00474584 + 0x50a8)) {
+    *param_5 = *(int *)(_DAT_00474584 + 0x50a8) -
+               *(int *)(_DAT_00474584 + 22000);
+}
+else {
+    *param_5 = 0;
+}</code></pre>
+<h4>BSim: does this generalize across the cohort?</h4>
+<p>This was the strongest Hajime match. <code>hajime_protocol_event_loop</code> matched all nine unpacked Hajime samples at a perfect 1.000 similarity with 959.920 confidence. The confidence is high because the function is large and behavior-rich. Unlike the Mirai runtime dead end, this is not a generic library function; it is stripped Hajime logic that survives across the unpacked cohort.</p>
+<table>
+<thead><tr><th>Matched sample</th><th>Similarity</th><th>Confidence</th></tr></thead>
+<tbody>
+<tr><td>Hajime1_unpacked</td><td>1.000</td><td>959.920</td></tr>
+<tr><td>Hajime2_unpacked</td><td>1.000</td><td>959.920</td></tr>
+<tr><td>Hajime3_unpacked</td><td>1.000</td><td>959.920</td></tr>
+<tr><td>Hajime4_unpacked</td><td>1.000</td><td>959.920</td></tr>
+<tr><td>Hajime5_unpacked</td><td>1.000</td><td>959.920</td></tr>
+<tr><td>Hajime7_unpacked</td><td>1.000</td><td>959.920</td></tr>
+<tr><td>Hajime8_unpacked</td><td>1.000</td><td>959.920</td></tr>
+<tr><td>Hajime9_unpacked</td><td>1.000</td><td>959.920</td></tr>
+<tr><td>Hajime10_unpacked</td><td>1.000</td><td>959.920</td></tr>
+</tbody>
+</table>
+<figure>
+<img alt="BSim Function Matches window: hajime_protocol_event_loop, 9 results across the unpacked Hajime cohort" src="images/hajime-protocol-event-loop.png"/>
+<figcaption>BSim function matches for <code>hajime_protocol_event_loop</code> across the unpacked Hajime cohort.</figcaption>
+</figure>
+<h3><code>hajime_peer_session_manager</code> — peer session creation and candidate collection hajime</h3>
+<p>This function manages active peer sessions. The first behavior that stood out is that it emits peer address records through a callback. It treats records with length <code>4</code> and <code>0x10</code> differently, then wraps those addresses with a port and passes them to <code>param_4</code>. Four address bytes plus two port bytes is an IPv4 contact record. Sixteen address bytes plus two port bytes is an IPv6 contact record. That is exactly the kind of data Hajime needs to exchange in a peer-to-peer network.</p>
+<pre><code>if (*(short *)(iVar18 + 0x14) == 4) {
+    local_3e = *(undefined4 *)(iVar18 + 4);
+    local_3a = CONCAT22(uVar1, local_3a._2_2_);
+    uVar19 = 6;
+    (*param_4)(param_5, 1, param_1, &amp;local_3e, uVar19);
+}
+else if (*(short *)(iVar18 + 0x14) == 0x10) {
+    local_3e = *(undefined4 *)(iVar18 + 4);
+    local_3a = *(undefined4 *)(iVar18 + 8);
+    local_36 = *(undefined4 *)(iVar18 + 0xc);
+    local_32 = *(undefined4 *)(iVar18 + 0x10);
+    local_2e = uVar1;
+    uVar19 = 0x12;
+    (*param_4)(param_5, 2, param_1, &amp;local_3e, uVar19);
+}</code></pre>
+<p>The next important behavior is session allocation and reuse. The function walks a global list rooted near <code>_DAT_00474584 + 0x5090</code>, looks for a session matching the current peer, and clears stale candidate entries. If no usable session exists and fewer than sixteen sessions are active, it allocates a new large session record and links it into the global list. The <code>0xc00</code> constant matters because it shows this is not a small helper. It is building a large state object for peer candidates, counters, timestamps, and address data.</p>
+<pre><code>if (*(int *)(_DAT_00474584 + 0x50e8) &lt; 0x10) {
+    puVar20 = (undefined4 *)0xc00;
+    psVar21 = (short *)(*_DAT_00474c44)(1);
+    if (psVar21 != (short *)0x0) {
+        *(undefined4 *)(psVar21 + 0x5fe) =
+            *(undefined4 *)(_DAT_00474584 + 0x5090);
+        *(short **)(_DAT_00474584 + 0x5090) = psVar21;
+        *(int *)(_DAT_00474584 + 0x50e8) =
+            *(int *)(_DAT_00474584 + 0x50e8) + 1;
+    }
+}</code></pre>
+<p>Once the session exists, the function fills it with candidate peers. It first inserts candidates from the current peer, then tries related peer/address structures, then falls back to the local node's own table if the session still has fewer than <code>0xe</code> candidates. Finally, it calls a helper at offset <code>0x2b20</code>, which appears to start or schedule communication for that session.</p>
+<pre><code>pcVar24 = (code *)(_DAT_0047458c + 0x57ac);
+(*pcVar24)(iVar14, psVar22);
+if (*(int *)(psVar22 + 0x5fc) &lt; 0xe) {
+    iVar16 = (*(code *)(_DAT_0047458c + 0x14ec))(iVar14);
+    if (*(int *)(iVar14 + 0xa8) != 0) {
+        (*pcVar24)(*(int *)(iVar14 + 0xa8), psVar22);
+    }
+    if (iVar16 != 0) {
+        (*pcVar24)(iVar16, psVar22);
+    }
+}
+(*(code *)(_DAT_0047458c + 0x2b20))(psVar22, param_4, param_5);</code></pre>
+<p>This function is the bridge between Hajime's passive peer database and its active peer communication. It does not build attack traffic. It builds peer sessions and collects contacts so the bot can keep participating in the decentralized network.</p>
+<h4>BSim: does this generalize across the cohort?</h4>
+<p><code>hajime_peer_session_manager</code> matched all nine unpacked Hajime samples at a perfect 1.000 similarity with 419.068 confidence. The confidence is lower than the protocol event loop because this function is smaller, but it is still a strong match. The result shows that Hajime's peer-session creation logic is stable across the unpacked samples.</p>
+<table>
+<thead><tr><th>Matched sample</th><th>Similarity</th><th>Confidence</th></tr></thead>
+<tbody>
+<tr><td>Hajime1_unpacked</td><td>1.000</td><td>419.068</td></tr>
+<tr><td>Hajime2_unpacked</td><td>1.000</td><td>419.068</td></tr>
+<tr><td>Hajime3_unpacked</td><td>1.000</td><td>419.068</td></tr>
+<tr><td>Hajime4_unpacked</td><td>1.000</td><td>419.068</td></tr>
+<tr><td>Hajime5_unpacked</td><td>1.000</td><td>419.068</td></tr>
+<tr><td>Hajime7_unpacked</td><td>1.000</td><td>419.068</td></tr>
+<tr><td>Hajime8_unpacked</td><td>1.000</td><td>419.068</td></tr>
+<tr><td>Hajime9_unpacked</td><td>1.000</td><td>419.068</td></tr>
+<tr><td>Hajime10_unpacked</td><td>1.000</td><td>419.068</td></tr>
+</tbody>
+</table>
+<figure>
+<img alt="BSim Function Matches window: hajime_peer_session_manager, 9 results across the unpacked Hajime cohort" src="images/hajime-peer-session-manager.png"/>
+<figcaption>BSim function matches for <code>hajime_peer_session_manager</code> across the unpacked Hajime cohort.</figcaption>
+</figure>
+<h3><code>hajime_peer_table_update</code> — peer address lookup, insert, retry, and eviction hajime</h3>
+<p>This function is the lower-level peer address table manager. It receives address-like input, validates it, rejects self or invalid addresses, then walks a linked list of stored peer records looking for a match. If it finds an existing record, it refreshes the stored address bytes and timestamps instead of allocating a duplicate.</p>
+<pre><code>puVar18 = (uint *)piVar5[8];
+puVar9 = puVar18;
+while (puVar9 != (uint *)0x0) {
+    uVar22 = (*(code *)(_DAT_0047458c + 0x24c4))(puVar9);
+    if ((int)((ulonglong)uVar22 &gt;&gt; 0x20) == 0) {
+        (*_DAT_00474e0c)(puVar9 + 5, param_2, param_3);
+        puVar9[0x26] = *(uint *)(_DAT_00474584 + 22000);
+        return puVar9;
+    }
+    puVar9 = (uint *)puVar9[0x2a];
+}</code></pre>
+<p>If the address is new, the function either inserts a fresh record or reuses a stale one. A fresh peer record is <code>0xac</code> bytes, and each table is capped at eight records. The function copies the peer address into the record, stores the address length, timestamps it, links it into the list, and increments the table count. That is classic peer-cache behavior.</p>
+<pre><code>if (piVar5[6] &lt; 8) {
+    uVar21 = (*_DAT_00474c44)(1, 0xac);
+    puVar9 = (uint *)((ulonglong)uVar21 &gt;&gt; 0x20);
+    (*_DAT_00474e0c)(puVar9 + 5, param_2, param_3);
+    puVar9[0x25] = param_3;
+    puVar9[0x26] = *(uint *)(_DAT_00474584 + 22000);
+    puVar9[0x2a] = piVar5[8];
+    piVar5[8] = (int)puVar9;
+    piVar5[6] = piVar5[6] + 1;
+    return puVar9;
+}</code></pre>
+<p>The most interesting branch is the eviction and retry path. If the table is full, the function searches for entries with too many failures and old timestamps. When it finds a stale candidate, it overwrites the address bytes, resets retry and age counters, refreshes the timestamp, and returns the reused record. That makes this more than a simple lookup routine. It is actively maintaining the health of Hajime's peer database over time.</p>
+<pre><code>if ((2 &lt; (int)puVar9[0x29]) &amp;&amp;
+    ((int)puVar9[0x28] &lt; *(int *)(_DAT_00474584 + 22000) - 0xf)) {
+    (*_DAT_00474e0c)(puVar9 + 5, param_2, param_3);
+    puVar9[0x26] = *(uint *)(_DAT_00474584 + 22000);
+    puVar9[0x27] = 0;
+    puVar9[0x28] = 0;
+    puVar9[0x29] = 0;
+    return puVar9;
+}</code></pre>
+<p>The function also records recent IPv4 and IPv6 peer activity separately. The address-family checks use <code>2</code> and <code>10</code>, which line up with IPv4 and IPv6. This is another reason the function looks like Hajime peer infrastructure rather than generic library code.</p>
+<pre><code>if (local_30 != 0) {
+    if (*param_2 == 2) {
+        *(uint *)(_DAT_00474584 + 0x55f8) =
+            *(uint *)(_DAT_00474584 + 22000);
+    }
+    else {
+        *(uint *)(_DAT_00474584 + 0x55fc) =
+            *(uint *)(_DAT_00474584 + 22000);
+    }
+}</code></pre>
+<h4>BSim: does this generalize across the cohort?</h4>
+<p><code>hajime_peer_table_update</code> matched all nine unpacked Hajime samples at a perfect 1.000 similarity with 625.346 confidence. The confidence is higher than the session manager because the function is larger and contains more distinctive control-flow. This result shows that Hajime's peer-address maintenance logic is conserved across the cohort.</p>
+<table>
+<thead><tr><th>Matched sample</th><th>Similarity</th><th>Confidence</th></tr></thead>
+<tbody>
+<tr><td>Hajime1_unpacked</td><td>1.000</td><td>625.346</td></tr>
+<tr><td>Hajime2_unpacked</td><td>1.000</td><td>625.346</td></tr>
+<tr><td>Hajime3_unpacked</td><td>1.000</td><td>625.346</td></tr>
+<tr><td>Hajime4_unpacked</td><td>1.000</td><td>625.346</td></tr>
+<tr><td>Hajime5_unpacked</td><td>1.000</td><td>625.346</td></tr>
+<tr><td>Hajime7_unpacked</td><td>1.000</td><td>625.346</td></tr>
+<tr><td>Hajime8_unpacked</td><td>1.000</td><td>625.346</td></tr>
+<tr><td>Hajime9_unpacked</td><td>1.000</td><td>625.346</td></tr>
+<tr><td>Hajime10_unpacked</td><td>1.000</td><td>625.346</td></tr>
+</tbody>
+</table>
+<figure>
+<img alt="BSim Function Matches window: hajime_peer_table_update, 9 results across the unpacked Hajime cohort" src="images/hajime-peer-table-update.png"/>
+<figcaption>BSim function matches for <code>hajime_peer_table_update</code> across the unpacked Hajime cohort.</figcaption>
+</figure>
+<div>
+<div>Hajime takeaway</div>
+<p>The important Hajime functions are not flood routines like Mirai's. They are peer-to-peer infrastructure: parsing protocol messages, maintaining address records, creating peer sessions, and scheduling future communication. That supports the project hypothesis: Hajime is similar to Mirai because it occupies the same IoT worm ecosystem, but it is not a simple sister branch of Mirai's source code.</p>
+</div>
+<!-- ===================== COMPARISON ===================== -->
+<h2 id="comparison">Mirai vs. Hajime: Compare and Contrast</h2>
+<p>At a high level the two families are mirror images. They infect the same devices through the same weakness, then do opposite things with them.</p>
+<table>
+<thead><tr><th>Dimension</th><th>Mirai</th><th>Hajime</th></tr></thead>
+<tbody>
+<tr><td>Purpose</td><td>Malicious DDoS botnet</td><td>Vigilante worm that hardens devices</td></tr>
+<tr><td>Command and control</td><td>Centralized server</td><td>Decentralized P2P over BitTorrent DHT and uTP, RC4 encrypted</td></tr>
+<tr><td>Payload</td><td>Multiple flood attacks (syn, udpplain, and more)</td><td>No attack payload, closes abused ports</td></tr>
+<tr><td>Packing</td><td>Usually unpacked, often stripped</td><td>Packed, custom framed LZMA in my samples</td></tr>
+<tr><td>Structure</td><td>Single binary</td><td>Core implant plus separate attack module</td></tr>
+<tr><td>Propagation</td><td>Telnet and default credentials</td><td>Telnet and default credentials</td></tr>
+<tr><td>Architectures</td><td>MIPS, ARM, SH, m68k, and more</td><td>arm5, arm6, arm7, mipseb, mipsel</td></tr>
+</tbody>
+</table>
+<p>The shared propagation method is what makes a similarity comparison tempting, but the reverse engineering points away from a simple source-code relationship. Mirai's important functions are attack and survival routines: <code>syn_attack</code>, <code>udpplain_attack</code>, and <code>cleanup_old_processes</code>. Hajime's important functions are P2P infrastructure: message parsing, peer table updates... (10 KB left)
